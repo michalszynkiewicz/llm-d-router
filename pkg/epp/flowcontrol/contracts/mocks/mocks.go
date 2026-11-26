@@ -27,7 +27,7 @@ limitations under the License.
 // in-memory simulation of the real component's behavior, while also providing function-based overrides
 // (e.g., `AddFunc`) that allow tests to inject specific errors or pause execution at critical moments. This strategy is
 // essential for creating the robust, non-flaky tests needed to verify the correctness of the system's concurrent logic.
-// For a more detailed defense of this strategy, see the comment at the top of `controller/internal/processor_test.go`.
+// For a more detailed defense of this strategy, see the comment at the top of `controller/processor_test.go`.
 package mocks
 
 import (
@@ -210,7 +210,7 @@ var _ contracts.SafeQueue = &MockSafeQueue{}
 // --- ManagedQueue Mock ---
 
 // MockManagedQueue is a high-fidelity, thread-safe mock of the `contracts.ManagedQueue` interface, designed
-// specifically for testing the concurrent `controller/internal.Processor`.
+// specifically for testing the concurrent `controller/Processor`.
 //
 // This mock is essential for creating deterministic and focused unit tests. It allows for precise control over queue
 // behavior and enables the testing of critical edge cases (e.g., empty queues, dispatch failures) in complete

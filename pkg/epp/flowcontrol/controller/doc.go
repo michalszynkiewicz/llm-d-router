@@ -30,7 +30,7 @@ limitations under the License.
 //     goroutine: it acquires a flow lease from the contracts.FlowRegistry, hands the request to the Processor, and
 //     blocks until the request is finalized. It owns asynchronous finalization driven by the request Context
 //     (TTL/cancellation) and queue occupancy metrics.
-//   - The internal.Processor (Worker): A single, stateful, single-goroutine actor that owns the request data plane. It
+//   - The Processor (Worker): A single, stateful, single-goroutine actor that owns the request data plane. It
 //     runs the dispatch loop, performs capacity checks, sweeps externally finalized items, and finalizes requests
 //     synchronously (dispatch, capacity rejection, shutdown).
 //

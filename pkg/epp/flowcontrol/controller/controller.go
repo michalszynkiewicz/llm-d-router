@@ -30,7 +30,6 @@ import (
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
-	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/controller/internal"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/types"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
@@ -39,8 +38,8 @@ import (
 // processor is the minimal internal interface that the FlowController requires from its worker.
 type processor interface {
 	Run(ctx context.Context)
-	Submit(item *internal.FlowItem) error
-	SubmitOrBlock(ctx context.Context, item *internal.FlowItem) error
+	Submit(item *FlowItem) error
+	SubmitOrBlock(ctx context.Context, item *FlowItem) error
 }
 
 // processorFactory defines the signature for creating a Processor.
@@ -57,10 +56,10 @@ type processorFactory func(
 	cleanupSweepInterval time.Duration,
 	enqueueChannelBufferSize int,
 	logger logr.Logger,
-	reclamation *internal.ReclamationController,
+	reclamation *ReclamationController,
 ) processor
 
-var _ processor = &internal.Processor{}
+var _ processor = &Processor{}
 
 // FlowController is the central, high-throughput engine of the Flow Control layer.
 // It is the request-facing front end that hands each request to a single stateful worker (the Processor) and blocks
@@ -109,7 +108,7 @@ type Deps struct {
 	// InFlightEvictor enables demand-driven in-flight eviction when Config.EnableEviction is set.
 	// Satisfied by *eviction.RequestEvictor. The FlowController registers the reclamation
 	// controller's Confirm as the evictor's eviction-terminated listener.
-	InFlightEvictor internal.InFlightEvictor
+	InFlightEvictor InFlightEvictor
 }
 
 // NewFlowController creates and starts a new FlowController instance.
@@ -155,9 +154,9 @@ func NewFlowController(
 			cleanupSweepInterval time.Duration,
 			enqueueChannelBufferSize int,
 			logger logr.Logger,
-			reclamation *internal.ReclamationController,
+			reclamation *ReclamationController,
 		) processor {
-			return internal.NewProcessor(
+			return NewProcessor(
 				ctx,
 				poolName,
 				registry,
@@ -181,10 +180,10 @@ func NewFlowController(
 	// Demand-driven in-flight eviction is active only when both the config enables it and the
 	// eviction plumbing was wired in. The reclamation controller's Confirm becomes the evictor's
 	// eviction-terminated listener, closing the confirmation loop.
-	var reclamation *internal.ReclamationController
+	var reclamation *ReclamationController
 	if config.EnableEviction && deps.InFlightEvictor != nil {
-		reclamation = internal.NewReclamationController(
-			internal.ReclamationConfig{
+		reclamation = NewReclamationController(
+			ReclamationConfig{
 				MaxRevocationsPerDecision: config.MaxRevocationsPerDecision,
 				ConfirmationGrace:         config.EvictionConfirmationGrace,
 				ConfirmationTimeout:       config.EvictionConfirmationTimeout,
@@ -388,9 +387,9 @@ func (fc *FlowController) tryDistribution(
 	enqueueTime time.Time,
 	saturationTTL time.Duration,
 	conn contracts.ActiveFlowConnection,
-) (*internal.FlowItem, error) {
+) (*FlowItem, error) {
 	// We must create a fresh FlowItem on each attempt as finalization is per-lifecycle.
-	item := internal.NewItem(reqCtx, req, saturationTTL, enqueueTime, fc.clock, fc.logger)
+	item := NewItem(reqCtx, req, saturationTTL, enqueueTime, fc.clock, fc.logger)
 
 	dp := conn.GetDataPlane()
 	_, err := dp.ManagedQueue(conn.FlowKey())
@@ -433,7 +432,7 @@ func (fc *FlowController) tryDistribution(
 	return item, item.FinalState().Err
 }
 
-func finalizeOnControllerShutdown(item *internal.FlowItem) error {
+func finalizeOnControllerShutdown(item *FlowItem) error {
 	item.Finalize(types.ErrFlowControllerNotRunning)
 	return item.FinalState().Err
 }
@@ -442,7 +441,7 @@ func finalizeOnControllerShutdown(item *internal.FlowItem) error {
 // itself due to context expiry or shutdown (asynchronously).
 func (fc *FlowController) awaitFinalization(
 	reqCtx context.Context,
-	item *internal.FlowItem,
+	item *FlowItem,
 ) error {
 	select {
 	case <-reqCtx.Done():
@@ -508,7 +507,7 @@ func (fc *FlowController) createRequestContext(
 //     Ownership retained by the Controller, which MUST finalize the item.
 func (fc *FlowController) distributeRequest(
 	ctx context.Context,
-	item *internal.FlowItem,
+	item *FlowItem,
 ) error {
 	reqID := item.OriginalRequest().ID()
 	// Reject items that expire during lease acquisition because Submit does not check the context.
