@@ -210,7 +210,7 @@ var _ contracts.SafeQueue = &MockSafeQueue{}
 // --- ManagedQueue Mock ---
 
 // MockManagedQueue is a high-fidelity, thread-safe mock of the `contracts.ManagedQueue` interface, designed
-// specifically for testing the concurrent `controller/Processor`.
+// specifically for testing the concurrent `controller.Processor`.
 //
 // This mock is essential for creating deterministic and focused unit tests. It allows for precise control over queue
 // behavior and enables the testing of critical edge cases (e.g., empty queues, dispatch failures) in complete

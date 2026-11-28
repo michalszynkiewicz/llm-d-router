@@ -35,32 +35,6 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
 )
 
-// processor is the minimal internal interface that the FlowController requires from its worker.
-type processor interface {
-	Run(ctx context.Context)
-	Submit(item *FlowItem) error
-	SubmitOrBlock(ctx context.Context, item *FlowItem) error
-}
-
-// processorFactory defines the signature for creating a Processor.
-type processorFactory func(
-	ctx context.Context,
-	registry contracts.FlowRegistry,
-	registryBackground contracts.FlowRegistryBackground,
-	saturationDetector flowcontrol.SaturationDetector,
-	endpointCandidates contracts.EndpointCandidates,
-	usageLimitPolicy flowcontrol.UsageLimitPolicy,
-	bandSelectionPolicy flowcontrol.BandSelectionPolicy,
-	clock clock.WithTicker,
-	noEndpointRequestTTL time.Duration,
-	cleanupSweepInterval time.Duration,
-	enqueueChannelBufferSize int,
-	logger logr.Logger,
-	reclamation *ReclamationController,
-) processor
-
-var _ processor = &Processor{}
-
 // FlowController is the central, high-throughput engine of the Flow Control layer.
 // It is the request-facing front end that hands each request to a single stateful worker (the Processor) and blocks
 // until the request reaches a terminal outcome.
@@ -85,8 +59,7 @@ type FlowController struct {
 	bandSelectionPolicy flowcontrol.BandSelectionPolicy
 	clock               clock.WithTicker
 	logger              logr.Logger
-	processorFactory    processorFactory
-	processor           processor
+	processor           *Processor
 
 	// --- Lifecycle state ---
 
@@ -103,7 +76,6 @@ type Deps struct {
 	UsageLimitPolicy    flowcontrol.UsageLimitPolicy
 	BandSelectionPolicy flowcontrol.BandSelectionPolicy
 	Clock               clock.WithTicker
-	ProcessorFactory    processorFactory
 
 	// InFlightEvictor enables demand-driven in-flight eviction when Config.EnableEviction is set.
 	// Satisfied by *eviction.RequestEvictor. The FlowController registers the reclamation
@@ -114,6 +86,21 @@ type Deps struct {
 // NewFlowController creates and starts a new FlowController instance.
 // The provided context governs the lifecycle of the controller and all its workers.
 func NewFlowController(
+	ctx context.Context,
+	poolName string,
+	config *Config,
+	deps Deps,
+) *FlowController {
+	var fc = newUnstartedFlowController(ctx, poolName, config, deps)
+	fc.logger.V(logutil.DEFAULT).Info("Starting the Processor.")
+
+	go fc.processor.Run(fc.parentCtx)
+
+	return fc
+}
+
+// newUnstartedFlowController creates a new FlowController instance without starting it.
+func newUnstartedFlowController(
 	ctx context.Context,
 	poolName string,
 	config *Config,
@@ -140,43 +127,6 @@ func NewFlowController(
 		parentCtx:           ctx,
 	}
 
-	if deps.ProcessorFactory == nil {
-		fc.processorFactory = func(
-			ctx context.Context,
-			registry contracts.FlowRegistry,
-			registryBackground contracts.FlowRegistryBackground,
-			saturationDetector flowcontrol.SaturationDetector,
-			endpointCandidates contracts.EndpointCandidates,
-			usageLimitPolicy flowcontrol.UsageLimitPolicy,
-			bandSelectionPolicy flowcontrol.BandSelectionPolicy,
-			clock clock.WithTicker,
-			noEndpointRequestTTL time.Duration,
-			cleanupSweepInterval time.Duration,
-			enqueueChannelBufferSize int,
-			logger logr.Logger,
-			reclamation *ReclamationController,
-		) processor {
-			return NewProcessor(
-				ctx,
-				poolName,
-				registry,
-				registryBackground,
-				saturationDetector,
-				endpointCandidates,
-				usageLimitPolicy,
-				bandSelectionPolicy,
-				clock,
-				noEndpointRequestTTL,
-				cleanupSweepInterval,
-				enqueueChannelBufferSize,
-				logger,
-				reclamation,
-			)
-		}
-	} else {
-		fc.processorFactory = deps.ProcessorFactory
-	}
-
 	// Demand-driven in-flight eviction is active only when both the config enables it and the
 	// eviction plumbing was wired in. The reclamation controller's Confirm becomes the evictor's
 	// eviction-terminated listener, closing the confirmation loop.
@@ -201,8 +151,9 @@ func NewFlowController(
 	}
 
 	// Construct a new worker, but do not start its goroutine yet.
-	fc.processor = fc.processorFactory(
+	fc.processor = NewProcessor(
 		fc.parentCtx,
+		poolName,
 		fc.flowRegistry,
 		fc.registryBackground,
 		fc.saturationDetector,
@@ -216,10 +167,6 @@ func NewFlowController(
 		fc.logger,
 		reclamation,
 	)
-
-	fc.logger.V(logutil.DEFAULT).Info("Starting the Processor.")
-
-	go fc.processor.Run(fc.parentCtx)
 
 	return fc
 }

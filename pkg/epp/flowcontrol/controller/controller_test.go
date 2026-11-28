@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -63,8 +64,7 @@ type controllerHarness struct {
 	mockRegistry *mockRegistryClient
 	// mockClock provides access to FakeClock methods (Step, HasWaiters) if and only if the underlying clock is a
 	// FakeClock.
-	mockClock            *testclock.FakeClock
-	mockProcessorFactory *mockProcessorFactory
+	mockClock *testclock.FakeClock
 }
 
 // unitHarnessOption allows configuring the test harness.
@@ -80,14 +80,15 @@ func withHarnessClock(c clock.WithTicker) unitHarnessOption {
 	}
 }
 
-// newUnitHarness creates a test environment with a mock processor factory, suitable for focused unit tests of the
-// controller's logic. It starts the controller's run loop using the provided context for lifecycle management.
+// newUnitHarness creates a test environment whose `Processor` is built but not running, suitable for focused unit
+// tests of the controller's logic. Nothing drains the enqueue channel, so the test decides what happens to a submitted
+// item: with `Config.EnqueueChannelBufferSize` 0 every submission blocks, and with a buffer the item waits in the
+// channel until the test receives it.
 func newUnitHarness(
 	ctx context.Context,
 	t *testing.T,
 	cfg *Config,
 	registry *mockRegistryClient,
-	processor *mockProcessor,
 	opts ...unitHarnessOption,
 ) *controllerHarness {
 	t.Helper()
@@ -102,8 +103,6 @@ func newUnitHarness(
 	mockDetector := &mockSaturationDetector{}
 	mockEndpointCandidates := &mocks.MockEndpointCandidates{}
 
-	mockProcessorFactory := &mockProcessorFactory{processor: processor}
-
 	usageLimitPolicy := usagelimits.DefaultPolicy()
 
 	// Default the registry if nil, simplifying tests that don't focus on registry interaction.
@@ -111,21 +110,19 @@ func newUnitHarness(
 		registry = &mockRegistryClient{FlowRegistryDataPlane: &mocks.MockRegistryDataPlane{}}
 	}
 
-	fc := NewFlowController(ctx, "test-pool", cfg, Deps{
+	fc := newUnstartedFlowController(ctx, "test-pool", cfg, Deps{
 		Registry:            registry,
 		SaturationDetector:  mockDetector,
 		EndpointCandidates:  mockEndpointCandidates,
 		UsageLimitPolicy:    usageLimitPolicy,
 		BandSelectionPolicy: bandselection.DefaultPolicy(),
 		Clock:               harnessOpts.clock,
-		ProcessorFactory:    mockProcessorFactory.new,
 	})
 	h := &controllerHarness{
-		fc:                   fc,
-		cfg:                  cfg,
-		clock:                harnessOpts.clock,
-		mockRegistry:         registry,
-		mockProcessorFactory: mockProcessorFactory,
+		fc:           fc,
+		cfg:          cfg,
+		clock:        harnessOpts.clock,
+		mockRegistry: registry,
 	}
 
 	if fc, ok := harnessOpts.clock.(*testclock.FakeClock); ok {
@@ -133,6 +130,35 @@ func newUnitHarness(
 	}
 
 	return h
+}
+
+// receiveItem takes the next submitted item off the enqueue channel, as the processor's run loop would.
+func (h *controllerHarness) receiveItem(t *testing.T) *FlowItem {
+	t.Helper()
+	select {
+	case item := <-h.fc.processor.enqueueChan:
+		return item
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for an item on the enqueue channel")
+		return nil
+	}
+}
+
+// dispatchNextItem finalizes the next submitted item as dispatched from a separate goroutine, so a test can call
+// EnqueueAndWait synchronously. onItem, when set, runs with the item before it is finalized.
+func (h *controllerHarness) dispatchNextItem(t *testing.T, onItem func(item *FlowItem)) {
+	t.Helper()
+	ctx := t.Context()
+	go func() {
+		select {
+		case item := <-h.fc.processor.enqueueChan:
+			if onItem != nil {
+				onItem(item)
+			}
+			item.FinalizeWithError(nil)
+		case <-ctx.Done():
+		}
+	}()
 }
 
 // newIntegrationHarness creates a test environment that uses real `Processor`s, suitable for integration tests
@@ -224,77 +250,6 @@ func (m *mockRegistryClient) ApplyDesiredPriorities(_ map[int]struct{}) {}
 
 func (m *mockRegistryClient) ExecuteGCCycle() {}
 
-// mockProcessor is a mock for the internal `Processor` interface.
-type mockProcessor struct {
-	SubmitFunc        func(item *FlowItem) error
-	SubmitOrBlockFunc func(ctx context.Context, item *FlowItem) error
-	// runCtx captures the context provided to the Run method for lifecycle assertions.
-	runCtx   context.Context
-	runCtxMu sync.RWMutex
-	// runStarted is closed when the Run method is called, allowing tests to synchronize with worker startup.
-	runStarted chan struct{}
-}
-
-func (m *mockProcessor) Submit(item *FlowItem) error {
-	if m.SubmitFunc != nil {
-		return m.SubmitFunc(item)
-	}
-	return nil
-}
-
-func (m *mockProcessor) SubmitOrBlock(ctx context.Context, item *FlowItem) error {
-	if m.SubmitOrBlockFunc != nil {
-		return m.SubmitOrBlockFunc(ctx, item)
-	}
-	return nil
-}
-
-func (m *mockProcessor) Run(ctx context.Context) {
-	m.runCtxMu.Lock()
-	m.runCtx = ctx
-	m.runCtxMu.Unlock()
-	if m.runStarted != nil {
-		close(m.runStarted)
-	}
-	// Block until the context is cancelled, simulating a running worker.
-	<-ctx.Done()
-}
-
-// Context returns the context captured during the Run method call.
-func (m *mockProcessor) Context() context.Context {
-	m.runCtxMu.RLock()
-	defer m.runCtxMu.RUnlock()
-	return m.runCtx
-}
-
-// mockProcessorFactory allows tests to inject specific `mockProcessor` instances.
-type mockProcessorFactory struct {
-	processor *mockProcessor
-}
-
-// new is the factory function conforming to the `ProcessorFactory` signature.
-func (f *mockProcessorFactory) new(
-	_ context.Context, // The factory does not use the lifecycle context; it's passed to the processor's Run method later.
-	_ contracts.FlowRegistry,
-	_ contracts.FlowRegistryBackground,
-	_ flowcontrol.SaturationDetector,
-	_ contracts.EndpointCandidates,
-	_ flowcontrol.UsageLimitPolicy,
-	_ flowcontrol.BandSelectionPolicy,
-	_ clock.WithTicker,
-	_ time.Duration,
-	_ time.Duration,
-	_ int,
-	_ logr.Logger,
-	_ *ReclamationController,
-) processor {
-	if f.processor != nil {
-		return f.processor
-	}
-	// Return a default mock processor if one is not explicitly registered by the test.
-	return &mockProcessor{}
-}
-
 var defaultFlowKey = flowcontrol.FlowKey{ID: "test-flow", Priority: 100}
 
 func newTestRequest(key flowcontrol.FlowKey) *fwkfcmocks.MockFlowControlRequest {
@@ -374,14 +329,8 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 		t.Run("OnBandTTLExpiredDuringFlowAcquisition", func(t *testing.T) {
 			t.Parallel()
 			const bandTTL = 20 * time.Millisecond
-			submitted := make(chan struct{}, 1)
-			processor := &mockProcessor{
-				SubmitFunc: func(_ *FlowItem) error {
-					submitted <- struct{}{}
-					return nil
-				},
-			}
-			h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: time.Minute}, nil, processor,
+			// The buffer lets a submission succeed, so an item left in the channel shows the request was submitted.
+			h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: time.Minute, EnqueueChannelBufferSize: 1}, nil,
 				withHarnessClock(clock.RealClock{}))
 			h.mockRegistry.WithConnectionFunc = func(
 				key flowcontrol.FlowKey,
@@ -401,22 +350,15 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 			require.Error(t, err)
 			assert.ErrorIs(t, err, types.ErrTTLExpired)
 			assert.Equal(t, types.QueueOutcomeRejectedOther, outcome)
-			assert.Empty(t, submitted, "expired request must not be submitted to the processor")
+			assert.Empty(t, h.fc.processor.enqueueChan, "expired request must not be submitted to the processor")
 		})
 
 		t.Run("OnReqCtxExpiredBeforeDistribution", func(t *testing.T) {
 			t.Parallel()
 			// Test that if the request context provided to EnqueueAndWait is already expired, it returns immediately.
 
-			// Configure processor to block until context expiry.
-			processor := &mockProcessor{
-				SubmitFunc: func(_ *FlowItem) error { return ErrProcessorBusy },
-				SubmitOrBlockFunc: func(ctx context.Context, _ *FlowItem) error {
-					<-ctx.Done()              // Wait for the context to be done.
-					return context.Cause(ctx) // Return the cause.
-				},
-			}
-			h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: 1 * time.Minute}, nil, processor)
+			// The unbuffered channel blocks any submission until the context expires.
+			h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: 1 * time.Minute}, nil)
 
 			h.mockRegistry.WithConnectionFunc = func(key flowcontrol.FlowKey, fn func(_ contracts.ActiveFlowConnection) error) error {
 				return fn(&mockActiveFlowConnection{
@@ -444,7 +386,7 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 			t.Parallel()
 			// Create a context specifically for the controller's lifecycle.
 			ctx, cancel := context.WithCancel(t.Context())
-			h := newUnitHarness(ctx, t, &Config{}, nil, nil)
+			h := newUnitHarness(ctx, t, &Config{}, nil)
 			cancel() // Immediately stop the controller.
 
 			req := newTestRequest(defaultFlowKey)
@@ -459,7 +401,7 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 		t.Run("OnControllerShutdownDuringFinalization", func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithCancel(t.Context())
-			h := newUnitHarness(ctx, t, &Config{}, nil, nil)
+			h := newUnitHarness(ctx, t, &Config{}, nil)
 			item := NewItem(context.Background(), newTestRequest(defaultFlowKey), 0, time.Now(), nil, logr.Discard())
 
 			result := make(chan error, 1)
@@ -482,7 +424,7 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 		t.Run("OnControllerShutdownTakesPrecedenceOverRequestCancellation", func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithCancel(t.Context())
-			h := newUnitHarness(ctx, t, &Config{}, nil, nil)
+			h := newUnitHarness(ctx, t, &Config{}, nil)
 			reqCtx, reqCancel := context.WithCancel(context.Background())
 			item := NewItem(context.Background(), newTestRequest(defaultFlowKey), 0, time.Now(), nil, logr.Discard())
 
@@ -499,7 +441,7 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 		t.Run("OnControllerShutdownPreservesQueuedOutcome", func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithCancel(t.Context())
-			h := newUnitHarness(ctx, t, &Config{}, nil, nil)
+			h := newUnitHarness(ctx, t, &Config{}, nil)
 			item := NewItem(context.Background(), newTestRequest(defaultFlowKey), 0, time.Now(), nil, logr.Discard())
 			item.SetHandle(&fwkfcmocks.MockQueueItemHandle{})
 
@@ -518,7 +460,7 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 		t.Run("OnRegistryConnectionError", func(t *testing.T) {
 			t.Parallel()
 			mockRegistry := &mockRegistryClient{FlowRegistryDataPlane: &mocks.MockRegistryDataPlane{}}
-			h := newUnitHarness(t.Context(), t, &Config{}, mockRegistry, nil)
+			h := newUnitHarness(t.Context(), t, &Config{}, mockRegistry)
 
 			expectedErr := errors.New("simulated connection failure")
 			// Configure the registry to fail when attempting to retrieve ActiveFlowConnection.
@@ -541,7 +483,7 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 		t.Run("OnManagedQueueError", func(t *testing.T) {
 			t.Parallel()
 			mockRegistry := &mockRegistryClient{FlowRegistryDataPlane: &mocks.MockRegistryDataPlane{}}
-			h := newUnitHarness(t.Context(), t, &Config{}, mockRegistry, nil)
+			h := newUnitHarness(t.Context(), t, &Config{}, mockRegistry)
 
 			// Create a faulty setup that successfully leases the flow but fails to return the
 			// ManagedQueue. The error wraps ErrPriorityBandNotFound (the realistic registry failure) to
@@ -587,8 +529,12 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 		const defaultTestTTL = 5 * time.Second
 
 		testCases := []struct {
-			name           string
-			setupProcessor func(t *testing.T) *mockProcessor
+			name string
+			// bufferSize is the enqueue channel buffer. With 0 the non-blocking submit reports busy and the blocking
+			// fallback waits, because nothing receives from the channel.
+			bufferSize int
+			// setup, when set, prepares the harness before EnqueueAndWait is called.
+			setup func(t *testing.T, h *controllerHarness)
 			// requestTTL overrides the default TTL for time-sensitive tests.
 			requestTTL      time.Duration
 			expectedOutcome types.QueueOutcome
@@ -596,15 +542,11 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 			expectErrIs     error
 		}{
 			{
-				name: "SubmitSucceeds_NonBlocking",
-				setupProcessor: func(t *testing.T) *mockProcessor {
-					return &mockProcessor{
-						SubmitFunc: func(item *FlowItem) error {
-							// Simulate asynchronous processing and successful dispatch.
-							go item.FinalizeWithError(nil)
-							return nil
-						},
-					}
+				name:       "SubmitSucceeds_NonBlocking",
+				bufferSize: 1,
+				setup: func(t *testing.T, h *controllerHarness) {
+					// Simulate asynchronous processing and successful dispatch.
+					h.dispatchNextItem(t, nil)
 				},
 				expectedOutcome: types.QueueOutcomeDispatched,
 			},
@@ -613,18 +555,7 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 				// NOTE: This relies on real time passing, as context.WithDeadline timers cannot be controlled by FakeClock.
 				name:       "Rejects_AfterBlocking_WhenTTL_Expires",
 				requestTTL: 50 * time.Millisecond, // Short TTL to keep the test fast.
-				setupProcessor: func(t *testing.T) *mockProcessor {
-					return &mockProcessor{
-						// Reject the non-blocking attempt.
-						SubmitFunc: func(_ *FlowItem) error { return ErrProcessorBusy },
-						// Block the fallback attempt until the context (carrying the TTL deadline) expires.
-						SubmitOrBlockFunc: func(ctx context.Context, _ *FlowItem) error {
-							<-ctx.Done()
-							return ctx.Err()
-						},
-					}
-				},
-				// No runActions needed; we rely on the real-time timer to expire.
+				// No setup needed; we rely on the real-time timer to expire.
 				// When the blocking call fails due to context expiry, the outcome is RejectedOther.
 				expectedOutcome: types.QueueOutcomeRejectedOther,
 				expectErr:       true,
@@ -633,29 +564,9 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 			},
 			{
 				name: "Rejects_OnProcessorShutdownDuringSubmit",
-				setupProcessor: func(t *testing.T) *mockProcessor {
-					return &mockProcessor{
-						// Simulate the processor shutting down during the non-blocking handoff.
-						SubmitFunc: func(_ *FlowItem) error { return types.ErrFlowControllerNotRunning },
-						SubmitOrBlockFunc: func(_ context.Context, _ *FlowItem) error {
-							return types.ErrFlowControllerNotRunning
-						},
-					}
-				},
-				expectedOutcome: types.QueueOutcomeRejectedOther,
-				expectErr:       true,
-				expectErrIs:     types.ErrFlowControllerNotRunning,
-			},
-			{
-				name: "Rejects_OnProcessorShutdownDuringSubmitOrBlock",
-				setupProcessor: func(t *testing.T) *mockProcessor {
-					return &mockProcessor{
-						SubmitFunc: func(_ *FlowItem) error { return ErrProcessorBusy },
-						// Simulate the processor shutting down during the blocking handoff.
-						SubmitOrBlockFunc: func(_ context.Context, _ *FlowItem) error {
-							return types.ErrFlowControllerNotRunning
-						},
-					}
+				setup: func(_ *testing.T, h *controllerHarness) {
+					// Simulate the processor shutting down while the controller's own lifecycle check still passes.
+					h.fc.processor.isShuttingDown.Store(true)
 				},
 				expectedOutcome: types.QueueOutcomeRejectedOther,
 				expectErr:       true,
@@ -671,11 +582,14 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 				mockRegistry := &mockRegistryClient{FlowRegistryDataPlane: &mocks.MockRegistryDataPlane{}}
 
 				// Configure the harness with the appropriate TTL.
-				harnessConfig := &Config{DefaultRequestTTL: defaultTestTTL}
+				harnessConfig := &Config{DefaultRequestTTL: defaultTestTTL, EnqueueChannelBufferSize: tc.bufferSize}
 				if tc.requestTTL > 0 {
 					harnessConfig.DefaultRequestTTL = tc.requestTTL
 				}
-				h := newUnitHarness(t.Context(), t, harnessConfig, mockRegistry, tc.setupProcessor(t))
+				h := newUnitHarness(t.Context(), t, harnessConfig, mockRegistry)
+				if tc.setup != nil {
+					tc.setup(t, h)
+				}
 
 				// Configure the registry to return the specified setup.
 				mockRegistry.WithConnectionFunc = func(
@@ -718,6 +632,45 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 				assert.Equal(t, tc.expectedOutcome, outcome, "outcome did not match expected value")
 			})
 		}
+
+		// The processor shuts down while the controller waits in the blocking fallback. With an unbuffered channel and no
+		// receiver, SubmitOrBlock is the only place EnqueueAndWait can block, so synctest.Wait returns once it is there.
+		t.Run("Rejects_OnProcessorShutdownDuringSubmitOrBlock", func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+
+				mockRegistry := &mockRegistryClient{FlowRegistryDataPlane: &mocks.MockRegistryDataPlane{}}
+				h := newUnitHarness(ctx, t, &Config{DefaultRequestTTL: defaultTestTTL}, mockRegistry)
+				mockRegistry.WithConnectionFunc = func(
+					key flowcontrol.FlowKey,
+					fn func(conn contracts.ActiveFlowConnection) error,
+				) error {
+					return fn(&mockActiveFlowConnection{
+						RegistryV: h.mockRegistry,
+						FlowKeyV:  key,
+					})
+				}
+
+				var outcome types.QueueOutcome
+				var err error
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					outcome, err = h.fc.EnqueueAndWait(context.Background(), newTestRequest(defaultFlowKey))
+				}()
+
+				synctest.Wait()
+				cancel()
+				<-done
+
+				require.Error(t, err, "expected an error during EnqueueAndWait but got nil")
+				assert.ErrorIs(t, err, types.ErrFlowControllerNotRunning, "error should wrap the shutdown cause")
+				assert.ErrorIs(t, err, types.ErrRejected, "rejection errors must wrap types.ErrRejected")
+				assert.Equal(t, types.QueueOutcomeRejectedOther, outcome, "outcome did not match expected value")
+			})
+		})
 	})
 
 	t.Run("Retry", func(t *testing.T) {
@@ -738,16 +691,8 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 				})
 			}
 			// Use a long TTL to ensure the failure is due to cancellation, not timeout.
-			processor := &mockProcessor{
-				// Reject non-blocking attempt.
-				SubmitFunc: func(_ *FlowItem) error { return ErrProcessorBusy },
-				// Block the fallback attempt until the context is cancelled.
-				SubmitOrBlockFunc: func(ctx context.Context, _ *FlowItem) error {
-					<-ctx.Done()
-					return ctx.Err()
-				},
-			}
-			h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: 10 * time.Second}, mockRegistry, processor)
+			// The unbuffered channel rejects the non-blocking attempt and blocks the fallback until the context is cancelled.
+			h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: 10 * time.Second}, mockRegistry)
 
 			// Create a cancellable context for the request.
 			reqCtx, cancelReq := context.WithCancel(context.Background())
@@ -775,19 +720,8 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 		t.Run("OnReqCtxCancelledAfterDistribution", func(t *testing.T) {
 			t.Parallel()
 			// Use a long TTL to ensure the failure is due to cancellation.
-
-			// Channel for synchronization.
-			itemSubmitted := make(chan *FlowItem, 1)
-
-			// Configure the processor to accept the item but never finalize it, simulating a queued request.
-			processor := &mockProcessor{
-				SubmitFunc: func(item *FlowItem) error {
-					item.SetHandle(&fwkfcmocks.MockQueueItemHandle{})
-					itemSubmitted <- item
-					return nil
-				},
-			}
-			h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: 10 * time.Second}, nil, processor)
+			// The buffer accepts the item; the test takes it and never finalizes it, simulating a queued request.
+			h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: 10 * time.Second, EnqueueChannelBufferSize: 1}, nil)
 
 			h.mockRegistry.WithConnectionFunc = func(key flowcontrol.FlowKey, fn func(_ contracts.ActiveFlowConnection) error) error {
 				return fn(&mockActiveFlowConnection{
@@ -808,14 +742,10 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 				close(done)
 			}()
 
-			// 1. Wait for the item to be successfully distributed.
-			var item *FlowItem
-			select {
-			case item = <-itemSubmitted:
-				// Success. Ownership has transferred. EnqueueAndWait is now in the select loop.
-			case <-time.After(1 * time.Second):
-				t.Fatal("timed out waiting for item to be submitted to the processor")
-			}
+			// 1. Wait for the item to be successfully distributed. Ownership has transferred and EnqueueAndWait waits for
+			// finalization. Setting the handle marks the item as queued.
+			item := h.receiveItem(t)
+			item.SetHandle(&fwkfcmocks.MockQueueItemHandle{})
 
 			// 2. Cancel the request context.
 			cancelReq()
@@ -848,23 +778,14 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 		t.Run("OnCallerDeadlineExpiredAfterDistribution", func(t *testing.T) {
 			t.Parallel()
 
-			itemSubmitted := make(chan *FlowItem, 1)
-
-			// Configure the processor to accept the item but never finalize it.
-			processor := &mockProcessor{
-				SubmitFunc: func(item *FlowItem) error {
-					item.SetHandle(&fwkfcmocks.MockQueueItemHandle{})
-					itemSubmitted <- item
-					return nil
-				},
-			}
-
+			// The buffer accepts the item; the test takes it and never finalizes it.
 			const callerDeadline = 50 * time.Millisecond
 			h := newUnitHarness(t.Context(), t, &Config{
-				DefaultRequestTTL:     time.Minute,
-				NoEndpointRequestTTL:  time.Minute,
-				ExpiryCleanupInterval: 10 * time.Millisecond,
-			}, nil, processor, withHarnessClock(clock.RealClock{}))
+				DefaultRequestTTL:        time.Minute,
+				NoEndpointRequestTTL:     time.Minute,
+				ExpiryCleanupInterval:    10 * time.Millisecond,
+				EnqueueChannelBufferSize: 1,
+			}, nil, withHarnessClock(clock.RealClock{}))
 
 			h.mockRegistry.WithConnectionFunc = func(key flowcontrol.FlowKey, fn func(_ contracts.ActiveFlowConnection) error) error {
 				return fn(&mockActiveFlowConnection{
@@ -888,13 +809,9 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 				close(done)
 			}()
 
-			// 1. Wait for the item to be submitted.
-			var item *FlowItem
-			select {
-			case item = <-itemSubmitted:
-			case <-time.After(1 * time.Second):
-				t.Fatal("timed out waiting for item to be submitted to the processor")
-			}
+			// 1. Wait for the item to be submitted and mark it as queued.
+			item := h.receiveItem(t)
+			item.SetHandle(&fwkfcmocks.MockQueueItemHandle{})
 
 			// 2. Wait for caller deadline to expire.
 			select {
@@ -924,80 +841,60 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 		// the flow while requests are queued.
 		t.Run("LeaseHeldDuringQueueing", func(t *testing.T) {
 			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				leaseReleased := make(chan struct{})
 
-			// Synchronization channels
-			leaseReleased := make(chan struct{})
-			processorEntered := make(chan struct{})
-			unblockProcessor := make(chan struct{})
+				// 1. Setup Registry: Trace when the lease is released.
+				mockRegistry := &mockRegistryClient{FlowRegistryDataPlane: &mocks.MockRegistryDataPlane{}}
+				mockRegistry.WithConnectionFunc = func(
+					key flowcontrol.FlowKey,
+					fn func(conn contracts.ActiveFlowConnection) error,
+				) error {
+					// Execute the controller's logic.
+					err := fn(&mockActiveFlowConnection{
+						RegistryV: mockRegistry,
+						FlowKeyV:  key,
+					})
+					// Signal that the closure has finished and the lease is about to be released.
+					close(leaseReleased)
+					return err
+				}
 
-			// 1. Setup Registry: Trace when the lease is released.
-			mockRegistry := &mockRegistryClient{FlowRegistryDataPlane: &mocks.MockRegistryDataPlane{}}
-			mockRegistry.WithConnectionFunc = func(
-				key flowcontrol.FlowKey,
-				fn func(conn contracts.ActiveFlowConnection) error,
-			) error {
-				// Execute the controller's logic.
-				err := fn(&mockActiveFlowConnection{
-					RegistryV: mockRegistry,
-					FlowKeyV:  key,
-				})
-				// Signal that the closure has finished and the lease is about to be released.
-				close(leaseReleased)
-				return err
-			}
+				// 2. Setup Processor: the unbuffered channel holds the request in the handoff until the test receives it.
+				h := newUnitHarness(t.Context(), t, &Config{}, mockRegistry)
 
-			// 2. Setup Processor: Simulate a long wait in the queue.
-			processor := &mockProcessor{
-				SubmitFunc: func(_ *FlowItem) error { return ErrProcessorBusy },
-				SubmitOrBlockFunc: func(ctx context.Context, item *FlowItem) error {
-					close(processorEntered) // Signal that we are now "queued"
-
-					// Block until the test allows us to proceed.
+				// requireLeaseHeld waits until EnqueueAndWait can make no further progress, then checks the lease.
+				requireLeaseHeld := func(phase string) {
+					t.Helper()
+					synctest.Wait()
 					select {
-					case <-unblockProcessor:
-						item.FinalizeWithError(nil)
-						return nil
-					case <-ctx.Done():
-						return ctx.Err()
+					case <-leaseReleased:
+						t.Fatalf("registry lease was released while the request was %s", phase)
+					default:
 					}
-				},
-			}
+				}
 
-			h := newUnitHarness(t.Context(), t, &Config{}, mockRegistry, processor)
+				// 3. Run EnqueueAndWait in the background.
+				go func() {
+					_, _ = h.fc.EnqueueAndWait(context.Background(), newTestRequest(defaultFlowKey))
+				}()
 
-			// 3. Run EnqueueAndWait in the background.
-			go func() {
-				_, _ = h.fc.EnqueueAndWait(context.Background(), newTestRequest(defaultFlowKey))
-			}()
+				// 4. The request is blocked in SubmitOrBlock.
+				requireLeaseHeld("blocked in the handoff")
 
-			// 4. Wait for the request to enter the queue (Blocking phase).
-			select {
-			case <-processorEntered:
-				// Success: The request is now blocked inside the processor.
-			case <-time.After(1 * time.Second):
-				t.Fatal("timed out waiting for request to enter processor")
-			}
+				// 5. Accept the item, as the run loop would. The request waits for finalization.
+				item := <-h.fc.processor.enqueueChan
+				requireLeaseHeld("queued")
 
-			// 5. Verify the lease is still held.
-			// If leaseReleased is closed, it means the controller returned from WithConnection while the request was still
-			// inside SubmitOrBlock.
-			select {
-			case <-leaseReleased:
-				t.Fatal("registry lease was released while the request was still queued.")
-			default:
-				// Success: The lease is still held.
-			}
-
-			// 6. Cleanup: Unblock the processor and allow the lease to release.
-			close(unblockProcessor)
-
-			// Verify that the lease is eventually released after processing finishes.
-			select {
-			case <-leaseReleased:
-				// Success
-			case <-time.After(1 * time.Second):
-				t.Fatal("timed out waiting for lease to release after processing finished")
-			}
+				// 6. Finalize the item and verify that the lease is released.
+				item.FinalizeWithError(nil)
+				synctest.Wait()
+				select {
+				case <-leaseReleased:
+				default:
+					t.Fatal("registry lease was not released after processing finished")
+				}
+			})
 		})
 	})
 }
@@ -1006,26 +903,31 @@ func TestFlowController_EnqueueAndWait(t *testing.T) {
 func TestFlowController_WorkerManagement(t *testing.T) {
 	t.Parallel()
 
-	// Startup validates that the worker starts
+	// Startup validates that the worker starts: a request reaches an outcome only if the run loop takes it off the
+	// enqueue channel and dispatches it.
 	t.Run("Startup", func(t *testing.T) {
 		t.Parallel()
 
-		mockRegistry := &mockRegistryClient{
-			FlowRegistryDataPlane: &mocks.MockRegistryDataPlane{},
-		}
+		h := newIntegrationHarness(t.Context(), t, &Config{
+			DefaultRequestTTL:        time.Minute,
+			EnqueueChannelBufferSize: 1,
+		}, setupRegistryForConcurrency(t, defaultFlowKey))
 
-		// Initialize the processor mock with the channel needed to synchronize startup.
-		processor := &mockProcessor{runStarted: make(chan struct{})}
+		var outcome types.QueueOutcome
+		var err error
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			outcome, err = h.fc.EnqueueAndWait(context.Background(), newTestRequest(defaultFlowKey))
+		}()
 
-		h := newUnitHarness(t.Context(), t, &Config{}, mockRegistry, processor)
-
-		// Wait for the worker goroutine to have started and captured its context.
 		select {
-		case <-h.mockProcessorFactory.processor.runStarted:
-			// Worker is running.
+		case <-done:
 		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for worker to start")
+			t.Fatal("timed out waiting for the worker to process a request")
 		}
+		require.NoError(t, err)
+		assert.Equal(t, types.QueueOutcomeDispatched, outcome)
 	})
 }
 
@@ -1283,18 +1185,6 @@ func TestFlowController_EnqueueAndWait_FallbackRewritesItemPriority(t *testing.T
 		unprovisionedSize bool
 		unprovisionedByte bool
 	)
-	processor := &mockProcessor{
-		SubmitFunc: func(item *FlowItem) error {
-			capturedKey = item.OriginalRequest().FlowKey()
-			inFlightQueueSize, _ = gaugeValue("llm_d_epp_flow_control_queue_size", "0")
-			inFlightBytes, _ = gaugeValue("llm_d_epp_flow_control_queue_bytes", "0")
-			_, unprovisionedSize = gaugeValue("llm_d_epp_flow_control_queue_size", "100")
-			_, unprovisionedByte = gaugeValue("llm_d_epp_flow_control_queue_bytes", "100")
-			go item.FinalizeWithError(nil)
-			return nil
-		},
-	}
-
 	registry := &mockRegistryClient{FlowRegistryDataPlane: &mocks.MockRegistryDataPlane{}}
 	registry.WithConnectionFunc = func(key flowcontrol.FlowKey, fn func(conn contracts.ActiveFlowConnection) error) error {
 		// Only priority 0 is provisioned; any other band is rejected, forcing the fallback.
@@ -1304,7 +1194,15 @@ func TestFlowController_EnqueueAndWait_FallbackRewritesItemPriority(t *testing.T
 		return fn(&mockActiveFlowConnection{RegistryV: registry, FlowKeyV: key})
 	}
 
-	h := newUnitHarness(ctx, t, &Config{DefaultRequestTTL: time.Minute}, registry, processor)
+	h := newUnitHarness(ctx, t, &Config{DefaultRequestTTL: time.Minute, EnqueueChannelBufferSize: 1}, registry)
+	// The item is finalized only after the gauges are read, so the values are the ones held while the request is queued.
+	h.dispatchNextItem(t, func(item *FlowItem) {
+		capturedKey = item.OriginalRequest().FlowKey()
+		inFlightQueueSize, _ = gaugeValue("llm_d_epp_flow_control_queue_size", "0")
+		inFlightBytes, _ = gaugeValue("llm_d_epp_flow_control_queue_bytes", "0")
+		_, unprovisionedSize = gaugeValue("llm_d_epp_flow_control_queue_size", "100")
+		_, unprovisionedByte = gaugeValue("llm_d_epp_flow_control_queue_bytes", "100")
+	})
 
 	req := newTestRequest(flowcontrol.FlowKey{ID: flowID, Priority: originalPriority})
 	req.InferencePoolNameV = poolName
@@ -1361,7 +1259,7 @@ func TestFlowController_EnqueueAndWait_FallbackConnectionFailureUsesFallbackPrio
 		return errors.New("fallback connection failed")
 	}
 
-	h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: time.Minute}, registry, &mockProcessor{})
+	h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: time.Minute}, registry)
 
 	req := newTestRequest(flowcontrol.FlowKey{ID: "batch", Priority: originalPriority})
 	req.InferencePoolNameV = poolName
@@ -1444,13 +1342,8 @@ func TestFlowController_EnqueueAndWait_QueueDurationCarriesTraceExemplar(t *test
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			processor := &mockProcessor{
-				SubmitFunc: func(item *FlowItem) error {
-					go item.FinalizeWithError(nil)
-					return nil
-				},
-			}
-			h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: time.Minute}, nil, processor)
+			h := newUnitHarness(t.Context(), t, &Config{DefaultRequestTTL: time.Minute, EnqueueChannelBufferSize: 1}, nil)
+			h.dispatchNextItem(t, nil)
 
 			// A flow ID per case keeps each case on its own series.
 			flowID := "queue-exemplar/" + tc.name
